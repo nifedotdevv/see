@@ -135,7 +135,9 @@ def _parse_categories(*values: Any) -> list[str]:
     haystack = " ".join(_clean_text(value).lower() for value in values if _clean_text(value))
     categories: list[str] = []
     for slug, keywords in SOURCE_CATEGORIES.items():
-        if any(re.search(r"(?<!\w)" + re.escape(keyword) + r"(?!\w)", haystack) for keyword in keywords):
+        # Whole-word match (so "fair" never matches "ai") with an optional
+        # plural suffix so "developers", "LLMs" and "NFTs" still match.
+        if any(re.search(r"(?<!\w)" + re.escape(keyword) + r"(?:s|es)?(?!\w)", haystack) for keyword in keywords):
             categories.append(slug)
     return _dedupe_preserve_order(categories)
 

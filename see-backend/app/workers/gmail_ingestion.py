@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 import imaplib
 import logging
 import re
@@ -9,7 +10,7 @@ from email.utils import parseaddr
 from typing import Any
 
 from app.core.config import settings
-from app.services.job_import import CAREER_CANDIDATE, MARKETING, career_signal, current_message_text
+from app.services.job_import import CAREER_CANDIDATE, MARKETING, career_signal, current_message_text, html_to_text
 
 
 logger = logging.getLogger(__name__)
@@ -132,8 +133,10 @@ def fetch_unread_job_emails() -> list[dict[str, Any]]:
                     pass
                 continue
 
-            stripped_text = " ".join(body.split()).strip()
-            raw_email = f"<raw_email>{stripped_text}</raw_email>"
+            # HTML-only mail must not leak markup into stripped_text, and the
+            # wrapper is escaped exactly like the Mailgun path.
+            stripped_text = " ".join(html_to_text(body).split()).strip()
+            raw_email = f"<raw_email>{html.escape(stripped_text)}</raw_email>"
             parsed_emails.append(
                 {
                     "uid": uid,

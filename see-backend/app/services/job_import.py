@@ -46,15 +46,46 @@ NON_RECRUITMENT = re.compile(
 )
 
 
+_HTML_MARKUP = re.compile(
+    r"<(?:!doctype|html|head|body|div|p|br|span|a|table|tr|td|th|tbody|ul|ol|li|font|b|i|u|strong|em|"
+    r"h[1-6]|img|meta|style|script|blockquote|center|hr)\b[^>]*>",
+    re.I,
+)
+# Quoted-history markers. A bare "From:" line is only a reply header when the
+# next line is another header (Sent/Date/To/Cc/Subject); ATS templates and
+# signatures often start a line with "From: <team name>".
+_QUOTE_SPLIT = re.compile(
+    r"(?im)^\s*(?:On .{1,250}wrote:|[- ]*Original Message[- ]*|--\s*$|"
+    r"From:\s.*\r?\n\s*(?:Sent|Date|To|Cc|Subject):)"
+)
+
+
+def looks_like_html(body: str | None) -> bool:
+    return bool(body and _HTML_MARKUP.search(body))
+
+
+def html_to_text(body: str | None, *, strip_quotes: bool = False) -> str:
+    """Return the text of an email body, parsing markup only when it is HTML.
+
+    Plain-text bodies are returned unchanged so text such as "<Staff Engineer>"
+    or "Jane <jane@acme.com>" is not swallowed as a tag.
+    """
+    body = (body or "")[:50_000]
+    if not looks_like_html(body):
+        return body
+    soup = BeautifulSoup(body, "html.parser")
+    selectors = "script, style, blockquote, .gmail_quote, .gmail_signature" if strip_quotes else "script, style"
+    for element in soup.select(selectors):
+        element.decompose()
+    for element in soup.find_all(["p", "div", "br", "li", "tr"]):
+        element.insert_before("\n")
+    return soup.get_text()
+
+
 def current_message_text(subject: str | None, body: str | None) -> str:
     """Exclude quoted threads/signatures so old recruitment text cannot qualify new mail."""
-    soup = BeautifulSoup((body or "")[:50_000], "html.parser")
-    for element in soup.select("script, style, blockquote, .gmail_quote, .gmail_signature"):
-        element.decompose()
-    for element in soup.find_all(["p", "div", "br", "li"]):
-        element.insert_before("\n")
-    plain = soup.get_text()
-    plain = re.split(r"(?im)^\s*(?:On .{1,250}wrote:|[- ]*Original Message[- ]*|--\s*$|From:\s)", plain, maxsplit=1)[0]
+    plain = html_to_text(body, strip_quotes=True)
+    plain = _QUOTE_SPLIT.split(plain, maxsplit=1)[0]
     plain = "\n".join(line for line in plain.splitlines() if not line.lstrip().startswith(">"))
     return " ".join(f"{subject or ''}\n{plain}".split())[:20_000]
 
