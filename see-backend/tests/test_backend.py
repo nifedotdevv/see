@@ -946,3 +946,24 @@ def test_parse_default_user_id_handles_bad_config():
     assert worker_email._parse_default_user_id("") is None
     assert worker_email._parse_default_user_id("not-a-uuid") is None
     assert worker_email._parse_default_user_id(str(USER_ID)) == USER_ID
+
+
+def test_luma_scrape_fetches_each_url_once(monkeypatch):
+    page_url = "https://lu.ma/discover"
+    event_url = "https://lu.ma/abc123"
+    listing = f'<html><body><a href="{event_url}">One</a><a href="{event_url}">Again</a></body></html>'
+    monkeypatch.setattr(settings, "LUMA_PAGE_URLS", f"{page_url},{page_url}")
+    calls: list[str] = []
+
+    def fake_fetch(url: str):
+        calls.append(url)
+        return "text/html", listing if url == page_url else "<html></html>"
+
+    async def fake_upsert(records):
+        return len(records)
+
+    monkeypatch.setattr(worker_ingest, "_fetch_url", fake_fetch)
+    monkeypatch.setattr(worker_ingest, "_upsert_events", fake_upsert)
+    run(worker_ingest.scrape_luma_events())
+    assert calls.count(page_url) == 1
+    assert calls.count(event_url) <= 1

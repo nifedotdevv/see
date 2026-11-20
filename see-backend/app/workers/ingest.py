@@ -761,6 +761,15 @@ def _luma_sitemap_urls(limit: int) -> list[str]:
     return result
 
 
+def _parse_luma_listing(body: Any, page_url: str) -> tuple[dict[str, Any] | None, list[str]]:
+    soup = BeautifulSoup(body, "html.parser")
+    return _normalize_luma_page_event(soup, page_url), list(_extract_luma_candidate_urls(soup, page_url))
+
+
+def _parse_luma_event_page(body: Any, page_url: str) -> dict[str, Any] | None:
+    return _normalize_luma_page_event(BeautifulSoup(body, "html.parser"), page_url)
+
+
 async def scrape_luma_events() -> int:
     records: list[dict[str, Any]] = []
     page_urls = _split_env_list(settings.LUMA_PAGE_URLS)
@@ -770,8 +779,13 @@ async def scrape_luma_events() -> int:
         return 0
 
     seen_external_ids: set[str] = set()
+    # Listing pages often link the same events; fetch each URL at most once.
+    fetched_urls: set[str] = set()
 
     for page_url in page_urls:
+        if page_url in fetched_urls:
+            continue
+        fetched_urls.add(page_url)
         try:
             content_type, body = await asyncio.to_thread(_fetch_url, page_url)
         except (HTTPError, URLError):
@@ -779,22 +793,24 @@ async def scrape_luma_events() -> int:
 
         if "html" not in content_type and "xml" not in content_type:
             continue
-        soup = BeautifulSoup(body, "html.parser")
-
-        page_record = _normalize_luma_page_event(soup, page_url)
+        # HTML parsing is CPU-bound; keep it off the event loop (this scrape
+        # can run inside the web process via the internal API).
+        page_record, candidate_urls = await asyncio.to_thread(_parse_luma_listing, body, page_url)
         if page_record is not None and page_record["external_id"] not in seen_external_ids:
             records.append(page_record)
             seen_external_ids.add(page_record["external_id"])
 
-        for candidate_url in _extract_luma_candidate_urls(soup, page_url):
+        for candidate_url in candidate_urls:
+            if candidate_url in fetched_urls:
+                continue
+            fetched_urls.add(candidate_url)
             try:
                 candidate_content_type, candidate_body = await asyncio.to_thread(_fetch_url, candidate_url)
             except (HTTPError, URLError):
                 continue
             if "html" not in candidate_content_type:
                 continue
-            candidate_soup = BeautifulSoup(candidate_body, "html.parser")
-            record = _normalize_luma_page_event(candidate_soup, candidate_url)
+            record = await asyncio.to_thread(_parse_luma_event_page, candidate_body, candidate_url)
             if record is None or record["external_id"] in seen_external_ids:
                 continue
             records.append(record)

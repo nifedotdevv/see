@@ -56,7 +56,12 @@ class Notification(Base):
 
 class NotificationDelivery(Base):
     __tablename__ = 'notification_deliveries'
-    __table_args__ = (UniqueConstraint('notification_id', 'device_id'),)
+    __table_args__ = (
+        UniqueConstraint('notification_id', 'device_id'),
+        Index('ix_notification_deliveries_status_next_attempt', 'status', 'next_attempt_at'),
+        Index('ix_notification_deliveries_status_updated', 'status', 'updated_at'),
+        Index('ix_notification_deliveries_device_id', 'device_id'),
+    )
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     notification_id: Mapped[UUID] = mapped_column(ForeignKey('notifications.id', ondelete='CASCADE'), nullable=False)
     device_id: Mapped[UUID] = mapped_column(ForeignKey('push_devices.id', ondelete='CASCADE'), nullable=False)
