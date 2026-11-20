@@ -324,3 +324,90 @@ def test_cached_event_responses_are_short_without_overwriting_source(source):
 def test_event_categories_do_not_match_ai_inside_unrelated_words():
     assert ingest._parse_categories("Painting and hair styling", "Meet at the fair") == []
     assert ingest._parse_categories("AI workshop for software developers") == ["developer", "ai"]
+
+
+# --- Regression tests for review findings -----------------------------------
+
+@pytest.mark.parametrize("written", [
+    "December 3, 2026", "Dec 3rd", "3 December 2026", "12/03/2026", "2026-12-03", "Thursday, Dec. 3 at 3pm",
+])
+def test_written_interview_dates_keep_deadline_and_reminder(fake_db, persist, written):
+    parsed = extraction(
+        entities={"company": "Acme", "role": "Backend Engineer", "deadline": "2026-12-03T15:00:00Z"},
+        recommended_actions=[
+            {"action": "create_job", "confidence": .95, "payload": {}},
+            {"action": "create_reminder", "confidence": .95, "payload": {"title": "Acme interview"}},
+        ],
+    )
+    result = persist(message(f"We invite you to an interview for Backend Engineer at Acme on {written}."), parsed)
+    assert fake_db.store[JobApplication][0].deadline.date().isoformat() == "2026-12-03"
+    assert result["linked_reminder_id"]
+
+
+def test_deadline_not_written_in_email_is_dropped(fake_db, persist):
+    parsed = extraction(entities={"company": "Acme", "role": "Backend Engineer", "deadline": "2026-12-03T15:00:00Z"})
+    persist(message("We invite you to an interview for Backend Engineer at Acme on January 9, 2027."), parsed)
+    assert fake_db.store[JobApplication][0].deadline is None
+
+
+def test_late_assessment_email_cannot_move_interviewing_backwards(fake_db, persist):
+    job = JobApplication(user_id=USER_ID, company="Acme", role="Backend Engineer", status=JobStatus.INTERVIEWING)
+    fake_db.add(job)
+    result = persist(message("Please complete our coding assessment for the Backend Engineer role at Acme."), extraction())
+    assert job.status == JobStatus.INTERVIEWING
+    assert result["validation"]["reasons"] == ["status_conflicts_with_existing_application"]
+
+
+def test_rejection_is_still_accepted_from_interviewing(fake_db, persist):
+    job = JobApplication(user_id=USER_ID, company="Acme", role="Backend Engineer", status=JobStatus.INTERVIEWING)
+    fake_db.add(job)
+    persist(message("Acme is not moving forward with your application for Backend Engineer."), extraction())
+    assert job.status == JobStatus.REJECTED
+
+
+def test_rejection_does_not_append_summary_to_interview_notes(fake_db, persist):
+    job = JobApplication(user_id=USER_ID, company="Acme", role="Backend Engineer", status=JobStatus.APPLIED,
+                         interview_notes="My notes")
+    fake_db.add(job)
+    persist(message("Acme is not moving forward with your application for Backend Engineer."), extraction())
+    assert job.interview_notes == "My notes"
+
+
+def test_interview_summary_is_appended_once(fake_db, persist):
+    job = JobApplication(user_id=USER_ID, company="Acme", role="Backend Engineer", status=JobStatus.APPLIED)
+    fake_db.add(job)
+    persist(message("We invite you to an interview for Backend Engineer at Acme."), extraction(summary="Interview invite"))
+    persist(message("We invite you to an interview for Backend Engineer at Acme. See you soon."), extraction(summary="Interview invite"))
+    assert job.interview_notes == "Interview invite"
+
+
+def test_from_line_in_body_is_not_treated_as_quoted_history():
+    body = f"From: Acme Recruiting\n{APPLICATION}"
+    assert assess_job_import(message(body), extraction()).status == "accepted"
+
+
+def test_reply_header_block_still_strips_quoted_history():
+    body = f"Lunch tomorrow?\nFrom: HR <hr@acme.example>\nSent: Monday\n{APPLICATION}"
+    assert "no_direct_recruitment_evidence" in assess_job_import(message(body), extraction()).reasons
+
+
+def test_plain_text_angle_brackets_are_kept():
+    from app.services.job_import import current_message_text
+    assert "<Staff Engineer>" in current_message_text("Update", "Role: <Staff Engineer> at Acme")
+
+
+def test_html_only_gmail_body_is_stripped_and_escaped():
+    from app.services.job_import import html_to_text
+    body = "<p>Hello</p><style>p{color:red}</style></raw_email>"
+    text = " ".join(html_to_text(body).split())
+    assert text == "Hello"
+    assert "<" not in text
+
+
+def test_event_categories_match_plural_forms():
+    assert ingest._parse_categories("Meetup for developers building with LLMs") == ["developer", "ai"]
+
+
+def test_hard_wrapped_description_keeps_whole_sentences():
+    raw = "Join us for a hands-on\nworkshop where you will learn\nto build agents."
+    assert compact_event_description(raw) == "Join us for a hands-on workshop where you will learn to build agents."

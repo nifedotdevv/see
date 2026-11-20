@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from functools import lru_cache
 
 from bs4 import BeautifulSoup
 
@@ -22,6 +23,25 @@ ORGANIZER_HEADING = re.compile(r"^(?:about (?:the |our )?(?:organizers?|hosts?|s
 USEFUL_DETAIL = re.compile(r"\b(?:learn|build|workshop|hackathon|hands.on|bring|prerequisite|eligib\w*|required|deadline|registration closes|prizes?|free|fee|cost|beginners?|experience)\b", re.I)
 
 
+def _unwrap_lines(text: str) -> list[str]:
+    """Rejoin hard-wrapped lines so a sentence split across lines stays whole.
+
+    A line continues the previous one when the previous line does not end a
+    sentence/heading and the next line starts in lowercase.
+    """
+    lines: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if lines and lines[-1] and line and not re.search(r"[.!?:]$", lines[-1]) and line[0].islower():
+            lines[-1] = f"{lines[-1]} {line}"
+        else:
+            lines.append(line)
+    return lines
+
+
+# Event lists serialize the same descriptions on every request; the function
+# is pure, so cache it to keep the HTML parse off the hot path.
+@lru_cache(maxsize=4096)
 def compact_event_description(value: str | None) -> str | None:
     if not value or not value.strip():
         return None
@@ -39,7 +59,7 @@ def compact_event_description(value: str | None) -> str | None:
     candidates: list[str] = []
     seen: set[str] = set()
     skip_section = False
-    for line in plain.splitlines():
+    for line in _unwrap_lines(plain):
         line = re.sub(r"[\u200b-\u200d\ufeff]", "", line)
         line = " ".join(line.split()).strip(" #*•-\t")
         if ORGANIZER_HEADING.fullmatch(line):

@@ -197,6 +197,57 @@ def _generate_email_extraction_with_gemini(
         return None
 
 
+_MONTHS = {name: i for i, names in enumerate((
+    (), ("jan", "january"), ("feb", "february"), ("mar", "march"), ("apr", "april"), ("may",),
+    ("jun", "june"), ("jul", "july"), ("aug", "august"), ("sep", "sept", "september"),
+    ("oct", "october"), ("nov", "november"), ("dec", "december"),
+)) for name in names}
+_MONTH_RE = r"(?P<{key}>" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + r")\.?"
+_DAY_RE = r"(?P<{key}>\d{{1,2}})(?:st|nd|rd|th)?"
+_DATE_PATTERNS = (
+    re.compile(r"\b(?P<y>\d{4})-(?P<m>\d{1,2})-(?P<d>\d{1,2})\b"),
+    re.compile(r"\b(?P<a>\d{1,2})[/.](?P<b>\d{1,2})[/.](?P<y>\d{4}|\d{2})\b"),
+    re.compile(r"\b" + _MONTH_RE.format(key="mn") + r"\s+" + _DAY_RE.format(key="d") + r"\b(?:,?\s+(?P<y>\d{4}))?", re.I),
+    re.compile(r"\b" + _DAY_RE.format(key="d") + r"(?:\s+of)?\s+" + _MONTH_RE.format(key="mn") + r"\b(?:,?\s+(?P<y>\d{4}))?", re.I),
+)
+
+
+def _dates_in_text(text: str) -> set[tuple[int, int, int | None]]:
+    """(month, day, year-or-None) for every calendar date written in the text.
+
+    Covers ISO, numeric (both M/D and D/M readings) and written-month formats
+    such as "December 3, 2026", "Dec 3rd" and "3 December 2026".
+    """
+    found: set[tuple[int, int, int | None]] = set()
+    for pattern in _DATE_PATTERNS:
+        for match in pattern.finditer(text):
+            groups = match.groupdict()
+            year = int(groups["y"]) if groups.get("y") else None
+            if year is not None and year < 100:
+                year += 2000
+            if groups.get("mn"):
+                pairs = [(_MONTHS[groups["mn"].lower()], int(groups["d"]))]
+            elif groups.get("a"):
+                a, b = int(groups["a"]), int(groups["b"])
+                pairs = [(a, b), (b, a)]
+            else:
+                pairs = [(int(groups["m"]), int(groups["d"]))]
+            found.update((m, d, year) for m, d in pairs if 1 <= m <= 12 and 1 <= d <= 31)
+    return found
+
+
+def _deadline_in_text(deadline: datetime, text: str) -> bool:
+    return any(
+        month == deadline.month and day == deadline.day and year in {None, deadline.year}
+        for month, day, year in _dates_in_text(text)
+    )
+
+
+# Forward progression of an application. Moving to an earlier stage (an old
+# or out-of-order email) needs review; rejection is allowed from any stage.
+_STATUS_RANK = {"bookmarked": 0, "applied": 1, "assessment": 2, "interviewing": 3, "offer": 4}
+
+
 def _combined_text(normalized: NormalizedEmailIngestPayload) -> str:
     return current_message_text(normalized.subject, normalized.body_plain or normalized.stripped_text)
 
@@ -476,9 +527,9 @@ async def persist_email_extraction(
         company = _clean_text(extraction.entities.company)
         role = _clean_text(extraction.entities.role)
         deadline = _coerce_utc_datetime(extraction.entities.deadline)
-        if deadline and deadline.date().isoformat() not in _combined_text(normalized):
-            # A model-proposed date must be present in the source. Unsupported
-            # natural-language dates remain unset instead of being guessed.
+        if deadline and not _deadline_in_text(deadline, _combined_text(normalized)):
+            # A model-proposed date must be written in the source (in any
+            # common format). Dates the email never mentions stay unset.
             deadline = None
 
         job_handled = False
@@ -495,8 +546,8 @@ async def persist_email_extraction(
                 matched_job = await _find_job_by_company(session, user_id, company, role)
                 if matched_job and matched_job.status.value != decision.job_status and (
                     matched_job.status in {JobStatus.OFFER, JobStatus.REJECTED, JobStatus.ARCHIVED}
-                    or decision.job_status == "bookmarked"
-                    or (decision.job_status == "applied" and matched_job.status != JobStatus.BOOKMARKED)
+                    or (decision.job_status in _STATUS_RANK
+                        and _STATUS_RANK[decision.job_status] < _STATUS_RANK.get(matched_job.status.value, -1))
                 ):
                     decision = ImportDecision("review", ("status_conflicts_with_existing_application",), decision.job_status, decision.evidence)
                     record.extraction_result = {**record.extraction_result, "validation": decision.audit()}
@@ -528,8 +579,11 @@ async def persist_email_extraction(
                             if next_status != existing_job.status and normalized.sender_verified:
                                 existing_job.status = next_status
                                 await notify_job_status(session, user_id, existing_job.id, next_status.value, normalized.raw_email_hash)
-                        if validated.interview_notes:
-                            existing_job.interview_notes = "\n\n".join(filter(None, [existing_job.interview_notes, validated.interview_notes]))[-20000:]
+                        new_notes = _clean_text(recommendation.payload.get("interview_notes")) if isinstance(recommendation.payload, dict) else ""
+                        if not new_notes and decision.job_status in {"assessment", "interviewing"}:
+                            new_notes = validated.interview_notes or ""
+                        if new_notes and new_notes not in (existing_job.interview_notes or ""):
+                            existing_job.interview_notes = "\n\n".join(filter(None, [existing_job.interview_notes, new_notes[:20000]]))[-20000:]
                         if deadline is not None:
                             existing_job.deadline = deadline
                         created_job = existing_job
