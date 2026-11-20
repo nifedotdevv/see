@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import DateTime, Float, Index, JSON, String, Text, func
+from sqlalchemy import DateTime, Float, Index, JSON, String, Text, func, text
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -12,7 +12,10 @@ from app.core.database import Base
 
 class EmailIngestion(Base):
     __tablename__ = "email_ingestions"
-    __table_args__ = (Index("uq_email_ingestions_raw_email_hash", "raw_email_hash", unique=True),)
+    __table_args__ = (
+        Index("uq_email_ingestions_raw_email_hash", "raw_email_hash", unique=True),
+        Index("ix_email_ingestions_linked_note_id", "linked_note_id", postgresql_where=text("linked_note_id IS NOT NULL")),
+    )
 
     id: Mapped[UUID] = mapped_column(primary_key=True, default=uuid4)
     raw_email_hash: Mapped[str] = mapped_column(String(64), nullable=False)

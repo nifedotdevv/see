@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import html
 import json
@@ -128,11 +129,22 @@ def build_email_extraction_payload(payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# Bound each extraction call so a stalled request falls back to heuristics
+# instead of holding a worker thread indefinitely.
+GEMINI_TIMEOUT_MS = 60_000
+
+
+@functools.lru_cache(maxsize=4)
+def _gemini_client_for(api_key: str) -> genai.Client:
+    # Reuse one client (and its connection pool) per key instead of one per email.
+    return genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=GEMINI_TIMEOUT_MS))
+
+
 def _gemini_client() -> genai.Client | None:
     api_key = getattr(settings, "GEMINI_API_KEY", "")
     if not api_key:
         return None
-    return genai.Client(api_key=api_key)
+    return _gemini_client_for(api_key)
 
 
 def _gemini_prompt(normalized: NormalizedEmailIngestPayload, existing_job: JobApplication | None = None) -> str:
@@ -533,6 +545,7 @@ async def persist_email_extraction(
             deadline = None
 
         job_handled = False
+        matched_job: JobApplication | None = None
         recommendations = extraction.recommended_actions if decision.status == "accepted" else []
         # Check the target before applying *any* side effects from this email.
         if recommendations:
@@ -559,7 +572,9 @@ async def persist_email_extraction(
                 if recommendation.action in {EmailActionType.CREATE_JOB, EmailActionType.UPDATE_JOB}:
                     if job_handled:
                         continue
-                    existing_job = await _find_job_by_company(session, user_id, company, role)
+                    # Same session/company/role as the conflict check above, and
+                    # nothing has been written since: reuse that lookup.
+                    existing_job = matched_job
                     validated = JobApplicationCreate.model_validate({
                         "company": company, "role": role,
                         "status": decision.job_status,

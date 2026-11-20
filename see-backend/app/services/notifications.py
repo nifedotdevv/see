@@ -5,9 +5,8 @@ from zoneinfo import ZoneInfo
 import hashlib
 import logging
 import httpx
-from sqlalchemy import select, update, text, func
+from sqlalchemy import select, update, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.orm import noload
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.models.notification import Notification, NotificationDelivery, NotificationPreference, PushDevice, SavedEvent
@@ -32,18 +31,34 @@ async def preference(db,user_id):
     record = await db.get(NotificationPreference,user_id)
     return Preferences.model_validate(record) if record else Preferences()
 
-async def put_notification(db,user_id,source,source_id,at,route,body,key):
+def _notification_row(user_id,source,source_id,at,route,body,key):
     identity = hashlib.sha256(f'{user_id}:{key}'.encode()).hexdigest()
-    statement = insert(Notification).values(id=uuid4(),user_id=user_id,dedupe_key=identity,source=source,source_id=source_id,
+    return dict(id=uuid4(),user_id=user_id,dedupe_key=identity,source=source,source_id=source_id,
         send_at=at,status='pending',route=route,body=body)
-    # Re-enable schedules that were cancelled by completion/disable toggles, but
-    # never re-send alerts that already reached the delivery stage.
-    await db.execute(statement.on_conflict_do_update(
-        index_elements=['dedupe_key'],
-        set_={'status':'pending','send_at':at,'route':route,'body':body},
-        where=(Notification.status=='cancelled'),
-    ))
-    return identity
+
+# At most 9 bound parameters per row; stay well below PostgreSQL's 32767 limit.
+_UPSERT_CHUNK = 1000
+
+async def put_notifications(db,rows):
+    """Upsert many schedules in one round trip per chunk.
+
+    Re-enable schedules that were cancelled by completion/disable toggles, but
+    never re-send alerts that already reached the delivery stage.
+    """
+    # ON CONFLICT cannot touch the same row twice in one statement.
+    unique=list({row['dedupe_key']:row for row in rows}.values())
+    for start in range(0,len(unique),_UPSERT_CHUNK):
+        statement=insert(Notification).values(unique[start:start+_UPSERT_CHUNK])
+        await db.execute(statement.on_conflict_do_update(
+            index_elements=['dedupe_key'],
+            set_={'status':'pending','send_at':statement.excluded.send_at,'route':statement.excluded.route,'body':statement.excluded.body},
+            where=(Notification.status=='cancelled'),
+        ))
+
+async def put_notification(db,user_id,source,source_id,at,route,body,key):
+    row=_notification_row(user_id,source,source_id,at,route,body,key)
+    await put_notifications(db,[row])
+    return row['dedupe_key']
 
 async def reconcile_user(db,user_id,now=None):
     now = now or datetime.now(UTC)
@@ -51,9 +66,9 @@ async def reconcile_user(db,user_id,now=None):
     await db.execute(text('SELECT pg_advisory_xact_lock(hashtext(:key))'),{'key':str(user_id)})
     await db.flush()
     prefs = await preference(db,user_id)
-    wanted=[]
+    rows=[]
     active_source_ids=[]
-    async def add(source,source_id,due,route,label,overdue=False):
+    def add(source,source_id,due,route,label,overdue=False):
         if due is None: return
         active_source_ids.append(source_id)
         for offset in sorted(set([0] + ([-prefs.advance_minutes] if prefs.advance_minutes else []) + ([prefs.overdue_minutes] if overdue and prefs.overdue_minutes else []))):
@@ -63,21 +78,27 @@ async def reconcile_user(db,user_id,now=None):
             if at < now-timedelta(hours=1) or at > now+timedelta(days=32): continue
             body = ('An item is overdue. ' if offset>0 else '') + label
             key=f'{source}:{source_id}:{due.isoformat()}:{offset}:{at.isoformat()}'
-            wanted.append(await put_notification(db,user_id,source,source_id,at,route,body,key))
+            rows.append(_notification_row(user_id,source,source_id,at,route,body,key))
     if prefs.enabled:
+        # Load only the columns scheduling needs, once; the agenda counts below
+        # reuse these rows instead of issuing separate COUNT queries.
+        job_fields=['deadline','interview_at','assessment_at','follow_up_at']
+        open_reminders=(await db.execute(select(Reminder.id,Reminder.due_date).where(
+            Reminder.user_id==user_id,Reminder.is_completed.is_(False)))).all()
+        open_jobs=(await db.execute(select(JobApplication.id,*[getattr(JobApplication,f) for f in job_fields]).where(
+            JobApplication.user_id==user_id,JobApplication.status.notin_([JobStatus.REJECTED,JobStatus.ARCHIVED])))).all()
         if prefs.reminders:
-            for r in (await db.execute(select(Reminder).where(Reminder.user_id==user_id,Reminder.is_completed.is_(False)))).scalars():
-                await add('reminder',r.id,r.due_date,f'/reminders/{r.id}','Open SEE to review your reminder.',True)
+            for r in open_reminders:
+                add('reminder',r.id,r.due_date,f'/reminders/{r.id}','Open SEE to review your reminder.',True)
         if prefs.jobs:
-            jobs=(await db.execute(select(JobApplication).options(noload(JobApplication.checklists)).where(JobApplication.user_id==user_id,JobApplication.status.notin_([JobStatus.REJECTED,JobStatus.ARCHIVED])))).scalars()
-            for j in jobs:
-                for field in ['deadline','interview_at','assessment_at','follow_up_at']:
-                    await add('job_'+field,j.id,getattr(j,field),f'/jobs/{j.id}','A career commitment is due. Open SEE for details.')
+            for j in open_jobs:
+                for field in job_fields:
+                    add('job_'+field,j.id,getattr(j,field),f'/jobs/{j.id}','A career commitment is due. Open SEE for details.')
         if prefs.events:
-            rows=(await db.execute(select(SavedEvent,ScrapedEvent).join(ScrapedEvent,SavedEvent.event_id==ScrapedEvent.id).where(SavedEvent.user_id==user_id))).all()
-            for saved,event in rows:
-                await add('event',saved.id,event.start_date,'/(tabs)/events','A saved event is starting soon.')
-                await add('registration',saved.id,saved.registration_deadline,'/(tabs)/events','A saved event registration deadline is approaching.')
+            saved_events=(await db.execute(select(SavedEvent,ScrapedEvent).join(ScrapedEvent,SavedEvent.event_id==ScrapedEvent.id).where(SavedEvent.user_id==user_id))).all()
+            for saved,event in saved_events:
+                add('event',saved.id,event.start_date,'/(tabs)/events','A saved event is starting soon.')
+                add('registration',saved.id,saved.registration_deadline,'/(tabs)/events','A saved event registration deadline is approaching.')
         local = now.astimezone(ZoneInfo(prefs.timezone))
         for day in range(2):
             at = local.replace(hour=prefs.agenda_hour,minute=0,second=0,microsecond=0)+timedelta(days=day)
@@ -85,9 +106,11 @@ async def reconcile_user(db,user_id,now=None):
                 if enabled and at.astimezone(UTC)>=now-timedelta(minutes=5):
                     send_at=quiet_time(at.astimezone(UTC),prefs)
                     horizon=send_at+timedelta(days=7 if source=='weekly' else 1)
-                    reminders_count=await db.scalar(select(func.count()).select_from(Reminder).where(Reminder.user_id==user_id,Reminder.is_completed.is_(False),Reminder.due_date<=horizon))
-                    jobs_count=await db.scalar(select(func.count()).select_from(JobApplication).where(JobApplication.user_id==user_id,JobApplication.status.notin_([JobStatus.REJECTED,JobStatus.ARCHIVED]),JobApplication.deadline<=horizon))
-                    wanted.append(await put_notification(db,user_id,source,None,send_at,'/(tabs)',f'{reminders_count} reminders and {jobs_count} application deadlines in your {source} agenda, including overdue items.', f'{source}:{at.date()}:{send_at.isoformat()}'))
+                    reminders_count=sum(1 for r in open_reminders if r.due_date is not None and r.due_date<=horizon)
+                    jobs_count=sum(1 for j in open_jobs if j.deadline is not None and j.deadline<=horizon)
+                    rows.append(_notification_row(user_id,source,None,send_at,'/(tabs)',f'{reminders_count} reminders and {jobs_count} application deadlines in your {source} agenda, including overdue items.', f'{source}:{at.date()}:{send_at.isoformat()}'))
+    await put_notifications(db,rows)
+    wanted=[row['dedupe_key'] for row in rows]
     invalid_snoozes=update(Notification).where(Notification.user_id==user_id,Notification.source=='snooze',Notification.source_id.is_not(None),Notification.status=='pending')
     if active_source_ids: invalid_snoozes=invalid_snoozes.where(Notification.source_id.notin_(active_source_ids))
     await db.execute(invalid_snoozes.values(status='cancelled'))
@@ -123,16 +146,19 @@ async def dispatch_notifications():
         await db.execute(update(NotificationDelivery).where(NotificationDelivery.status=='local',NotificationDelivery.next_attempt_at<now-timedelta(minutes=5)).values(status='delivered',updated_at=now))
         due=(await db.execute(select(Notification,PushDevice).join(PushDevice,PushDevice.user_id==Notification.user_id).where(
             Notification.status=='pending',Notification.send_at<=now,Notification.send_at>now-timedelta(hours=1),PushDevice.active.is_(True),PushDevice.last_seen_at>now-timedelta(days=30)))).all()
-        for n,d in due:
-            await db.execute(insert(NotificationDelivery).values(id=uuid4(),notification_id=n.id,device_id=d.id,status='pending',attempts=0,next_attempt_at=now,updated_at=now)
+        fanout=[dict(id=uuid4(),notification_id=n.id,device_id=d.id,status='pending',attempts=0,next_attempt_at=now,updated_at=now) for n,d in due]
+        for start in range(0,len(fanout),_UPSERT_CHUNK):
+            await db.execute(insert(NotificationDelivery).values(fanout[start:start+_UPSERT_CHUNK])
                 .on_conflict_do_nothing(index_elements=['notification_id','device_id']))
         rows=(await db.execute(select(NotificationDelivery,Notification,PushDevice).join(Notification,Notification.id==NotificationDelivery.notification_id).join(PushDevice,PushDevice.id==NotificationDelivery.device_id).where(
             NotificationDelivery.status=='pending',NotificationDelivery.next_attempt_at<=now,NotificationDelivery.attempts<5,
             Notification.status=='pending',Notification.send_at<=now,PushDevice.active.is_(True),PushDevice.user_id==Notification.user_id)
             .order_by(Notification.send_at).limit(100).with_for_update(of=NotificationDelivery,skip_locked=True))).all()
         batch=[]
+        prefs_by_user={}
         for delivery,n,device in rows:
-            prefs=await preference(db,n.user_id)
+            if n.user_id not in prefs_by_user: prefs_by_user[n.user_id]=await preference(db,n.user_id)
+            prefs=prefs_by_user[n.user_id]
             if not prefs.enabled:
                 delivery.status='cancelled';continue
             shifted=quiet_time(now,prefs)
@@ -167,8 +193,11 @@ async def dispatch_notifications():
             results=[{'status':'unknown'}]*len(batch)
         async with AsyncSessionLocal() as db:
             notification_ids=set()
+            by_id={d.id:d for d in (await db.execute(select(NotificationDelivery).where(
+                NotificationDelivery.id.in_([b[0] for b in batch])))).scalars()}
             for (delivery_id,device_id,_),result in zip(batch,results):
-                delivery=await db.get(NotificationDelivery,delivery_id)
+                delivery=by_id.get(delivery_id)
+                if delivery is None: continue
                 error=result.get('details',{}).get('error')
                 retryable=result.get('status')=='retry' or error=='MessageRateExceeded'
                 if result.get('status')=='ok': delivery.status='accepted'
@@ -202,7 +231,7 @@ async def dispatch_notifications():
 async def check_receipts():
     now=datetime.now(UTC)
     async with AsyncSessionLocal() as db:
-        deliveries=(await db.execute(select(NotificationDelivery).where(NotificationDelivery.status=='accepted',NotificationDelivery.updated_at<now-timedelta(minutes=15)).limit(100))).scalars().all()
+        deliveries=(await db.execute(select(NotificationDelivery).where(NotificationDelivery.status=='accepted',NotificationDelivery.updated_at<now-timedelta(minutes=15)).order_by(NotificationDelivery.updated_at).limit(100))).scalars().all()
         ids=[d.receipt_id for d in deliveries if d.receipt_id]
     if not ids:return
     headers={'Authorization':f'Bearer {settings.EXPO_ACCESS_TOKEN.get_secret_value()}'} if settings.EXPO_ACCESS_TOKEN else {}
@@ -213,10 +242,13 @@ async def check_receipts():
     except (httpx.HTTPError,ValueError):
         logger.warning('Push receipt check failed; will retry');return
     async with AsyncSessionLocal() as db:
+        by_id={d.id:d for d in (await db.execute(select(NotificationDelivery).where(
+            NotificationDelivery.id.in_([old.id for old in deliveries if receipts.get(old.receipt_id)])))).scalars()}
         for old in deliveries:
             receipt=receipts.get(old.receipt_id)
             if not receipt:continue
-            d=await db.get(NotificationDelivery,old.id)
+            d=by_id.get(old.id)
+            if d is None:continue
             d.status='delivered' if receipt.get('status')=='ok' else 'failed'
             d.error=receipt.get('details',{}).get('error')
             if d.error=='DeviceNotRegistered':
